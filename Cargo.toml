@@ -1,0 +1,18 @@
+[package]
+name = "rsf"
+version = "0.2.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Ranked Spreadsheet Format - Semantic model for tabular data"
+authors = ["Dustin Grover <dustinjgrover@gmail.com>"]
+keywords = ["csv", "spreadsheet", "data", "ranking", "cardinality"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1.0"
+regex = "1.10"
+
+[lib]
+name = "rsf"
+path = "src/lib.rs"
