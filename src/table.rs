@@ -607,9 +607,13 @@ impl Expr {
     pub fn evaluate(&self, row: &[FieldValue], columns: &[Column]) -> bool {
         match self {
             Expr::Column(name) => {
-                // Column reference — truthiness check (non-null = true)
+                // Column reference — truthiness check with boolean-aware evaluation.
                 if let Some(idx) = columns.iter().position(|c| &c.name == name) {
-                    !row.get(idx).map_or(true, |v| v.is_null())
+                    match row.get(idx) {
+                        None | Some(FieldValue::Null) => false,
+                        Some(FieldValue::Boolean(b)) => *b,
+                        Some(v) => !v.is_null(), // non-null text/numbers are truthy
+                    }
                 } else {
                     false
                 }
@@ -1104,7 +1108,7 @@ mod tests {
 
         let expr = Expr::parse("amount > 100", &table.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()).unwrap();
         let filtered = table.where_clause(&expr);
-        assert_eq!(filtered.row_count(), 2); // $200 and (implicitly) the one that parses to > 100
+        assert_eq!(filtered.row_count(), 1); // only $200 > 100
     }
 
     #[test]
@@ -1124,7 +1128,7 @@ mod tests {
 
         let expr = Expr::parse("amount > 100 AND status", &table.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()).unwrap();
         let filtered = table.where_clause(&expr);
-        assert_eq!(filtered.row_count(), 1); // only row 2: amount=200, status=true-ish? no, false. Let's check.
+        assert_eq!(filtered.row_count(), 0); // amount > 100 only matches row2, but its status is false; no row has both conditions true
     }
 
     #[test]
