@@ -474,6 +474,7 @@ impl<'a> Parser<'a> {
                 self.parse_in(col_name)
             }
             Some(Token::And | Token::Or | Token::RParen) => Ok(left),
+            None => Ok(left),
             other => Err(ParseError(format!("Unexpected token: {other:?}"))),
         }
     }
@@ -577,6 +578,7 @@ impl<'a> Parser<'a> {
             }
             Token::Bool(b) => Ok(FieldValue::Boolean(*b)),
             Token::Null => Ok(FieldValue::Null),
+            Token::StringLit(s) => Ok(FieldValue::Text(s.clone())),
             _ => Err(ParseError(format!("Expected value in IN list, got {token:?}"))),
         }
     }
@@ -1082,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_expr_parse_simple_comparison() {
-        let expr = Expr::parse("Amount > 100", &["id","amount","status"]).unwrap();
+        let expr = Expr::parse("Amount > 100", &["id".to_string(),"amount".to_string(),"status".to_string()].as_slice()).unwrap();
         assert!(matches!(&expr, Expr::BinaryOp(_, _, _)));
     }
 
@@ -1146,7 +1148,7 @@ mod tests {
 
     #[test]
     fn test_expr_parse_or() {
-        let expr = Expr::parse("id = 1 OR id = 3", &["id"]).unwrap();
+        let expr = Expr::parse("id = 1 OR id = 3", &["id".to_string()].as_slice()).unwrap();
         assert!(matches!(&expr, Expr::LogicalOp(_, _, _)));
     }
 
@@ -1209,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_expr_parse_invalid() {
-        let result = Expr::parse("amount >", &["amount"]);
+        let result = Expr::parse("amount >", &["amount".to_string()].as_slice());
         assert!(result.is_err());
     }
 
