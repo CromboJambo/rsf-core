@@ -60,29 +60,41 @@ impl fmt::Display for Token {
     }
 }
 
-/// An expression AST node for `where` clause evaluation.
+/// An expression AST node.
+///
+/// Used in two contexts:
+/// - **Predicate** — a `where` clause (the top-level node must reduce to a
+///   Boolean).
+/// - **Value** — a per-row expression for a derived column (e.g. `qty *
+///   price`); arithmetic operators produce a numeric `FieldValue` here.
 #[derive(Debug, Clone)]
 pub enum Expr {
     /// Column reference by name (e.g., `amount`)
     Column(String),
     /// A literal value
     Literal(FieldValue),
-    /// Binary comparison: left OP right
+    /// Binary operator: left OP right (comparison or arithmetic)
     BinaryOp(Box<Expr>, BinOp, Box<Expr>),
     /// Logical AND/OR between two expressions
     LogicalOp(BinLogOp, Box<Expr>, Box<Expr>),
     /// Unary NOT
     Not(Box<Expr>),
+    /// Unary minus (arithmetic negation)
+    Negate(Box<Expr>),
     /// IS NULL / IS NOT NULL
     NullCheck(String, bool), // (column_name, is_not)
     /// IN (val1, val2, ...)
     In(String, Vec<FieldValue>),
 }
 
-/// Binary comparison operators.
+/// Binary operators: comparisons (`Eq`..`Le`) and arithmetic
+/// (`Add`/`Sub`/`Mul`/`Div`). In predicate context the comparison ops
+/// yield a Boolean; in value context the arithmetic ops yield a numeric
+/// `FieldValue`.
 #[derive(Debug, Clone)]
 pub enum BinOp {
     Eq, Neq, Gt, Lt, Ge, Le,
+    Add, Sub, Mul, Div,
 }
 
 impl fmt::Display for BinOp {
@@ -94,6 +106,10 @@ impl fmt::Display for BinOp {
             BinOp::Lt => write!(f, "<"),
             BinOp::Ge => write!(f, ">="),
             BinOp::Le => write!(f, "<="),
+            BinOp::Add => write!(f, "+"),
+            BinOp::Sub => write!(f, "-"),
+            BinOp::Mul => write!(f, "*"),
+            BinOp::Div => write!(f, "/"),
         }
     }
 }
@@ -220,17 +236,30 @@ impl Tokenizer {
                     tokens.push(Token::Plus);
                 }
                 Some('-') => {
-                    // Distinguish unary minus from binary subtraction.
-                    // Unary: at start, after '(' or operator token, or after '='/comparison ops.
-                    let is_unary = tokens.is_empty()
-                        || matches!(tokens.last(), Some(Token::LParen | Token::Eq | Token::Neq | Token::Gt | Token::Lt | Token::Ge | Token::Le | Token::And | Token::Or | Token::Not));
                     self.advance();
-                    if is_unary {
-                        // Read as a negative number literal directly.
-                        if let Some(n) = self.try_read_negative_number() {
-                            tokens.push(Token::Number(n));
-                        } else {
-                            tokens.push(Token::Minus);
+                    // Binary minus: previous token is a *value* (column, literal, or `)`).
+                    // The value-token set is closed and small, so this check is complete —
+                    // the Rust `i32`/`u32` insight: define the closed set, not the open one.
+                    // Unary minus: everywhere else (start, after `(`, after any operator).
+                    // In unary position, fold `-<digit>` into a negative number literal
+                    // (a safe lexical optimisation — the grammar never needs to see it).
+                    let is_binary = matches!(
+                        tokens.last(),
+                        Some(
+                            Token::Ident(_)
+                            | Token::StringLit(_)
+                            | Token::Number(_)
+                            | Token::Bool(_)
+                            | Token::Null
+                            | Token::RParen,
+                        ),
+                    );
+                    if is_binary {
+                        tokens.push(Token::Minus);
+                    } else if self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        let tok = self.read_number()?;
+                        if let Token::Number(n) = tok {
+                            tokens.push(Token::Number(-n));
                         }
                     } else {
                         tokens.push(Token::Minus);
@@ -367,9 +396,70 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse an expression: handles OR (lowest precedence), then AND, then comparisons.
+    /// Entry point for a full expression. Precedence, loosest to tightest:
+    /// OR → AND → NOT → comparison (=, !=, >, <, >=, <=) → arithmetic
+    /// (+, -, *, /) → primary. So `a + b > 5` parses as `(a + b) > 5`, and
+    /// `a > 5 + 1` parses as `a > (5 + 1)` because `parse_comparison` takes
+    /// its operands from `parse_arithmetic`.
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_or()?;
+        self.parse_or()
+    }
+
+    /// Additive level: `term (+|- term)*`.
+    fn parse_arithmetic(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            match self.peek() {
+                Some(Token::Plus) => {
+                    self.advance();
+                    let right = self.parse_multiplicative()?;
+                    left = Expr::BinaryOp(Box::new(left), BinOp::Add, Box::new(right));
+                }
+                Some(Token::Minus) => {
+                    self.advance();
+                    let right = self.parse_multiplicative()?;
+                    left = Expr::BinaryOp(Box::new(left), BinOp::Sub, Box::new(right));
+                }
+                _ => break,
+            }
+        }
         Ok(left)
+    }
+
+    /// Multiplicative level: `unary (*|/ unary)*`.
+    fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_unary()?;
+        loop {
+            match self.peek() {
+                Some(Token::Star) => {
+                    self.advance();
+                    let right = self.parse_unary()?;
+                    left = Expr::BinaryOp(Box::new(left), BinOp::Mul, Box::new(right));
+                }
+                Some(Token::Slash) => {
+                    self.advance();
+                    let right = self.parse_unary()?;
+                    left = Expr::BinaryOp(Box::new(left), BinOp::Div, Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+
+    /// Unary level: an optional leading minus (negation), then a primary.
+    ///
+    /// The tokenizer already folds `-<number>` into a negative literal, so a
+    /// bare `Minus` token here is a negation of a column or parenthesized
+    /// expression (e.g. `-a` or `-(a + b)`). Binary subtraction is handled at
+    /// the arithmetic level, never here.
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if let Some(Token::Minus) = self.peek() {
+            self.advance(); // consume the minus
+            let operand = self.parse_unary()?;
+            return Ok(Expr::Negate(Box::new(operand)));
+        }
+        self.parse_primary()
     }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
@@ -443,8 +533,9 @@ impl<'a> Parser<'a> {
             return Err(ParseError("IS NULL requires a column reference".into()));
         }
 
-        // Parse left-hand side (column or literal)
-        let left = self.parse_primary()?;
+        // Parse left-hand side: a full arithmetic expression, so `a + b > 5`
+        // parses as `(a + b) > 5`.
+        let left = self.parse_arithmetic()?;
 
         // Check for binary comparison operator
         match self.peek() {
@@ -458,7 +549,7 @@ impl<'a> Parser<'a> {
                     Token::Le => BinOp::Le,
                     _ => unreachable!(),
                 };
-                let right = self.parse_primary()?;
+                let right = self.parse_arithmetic()?;
                 Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right)))
             }
             Some(Token::In) => {
@@ -593,6 +684,49 @@ impl<'a> Parser<'a> {
 }
 
 impl Expr {
+    /// Collect the names of all columns referenced by this expression,
+    /// in first-seen order, without duplicates.
+    ///
+    /// Note: only identifiers that *parsed as column references* are
+    /// included — the parser degrades unknown identifiers to string
+    /// literals, so this list is a subset of the table's actual columns.
+    /// Use it to validate that every *intended* reference resolved.
+    pub fn referenced_columns(&self) -> Vec<String> {
+        fn walk(e: &Expr, out: &mut Vec<String>) {
+            match e {
+                Expr::Column(name) => {
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+                Expr::Literal(_) => {}
+                Expr::BinaryOp(l, _, r) => {
+                    walk(l, out);
+                    walk(r, out);
+                }
+                Expr::LogicalOp(_, l, r) => {
+                    walk(l, out);
+                    walk(r, out);
+                }
+                Expr::Not(inner) => walk(inner, out),
+                Expr::Negate(inner) => walk(inner, out),
+                Expr::NullCheck(name, _) => {
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+                Expr::In(name, _) => {
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+
     /// Parse an expression string into an AST.
     pub fn parse(input: &str, column_names: &[String]) -> Result<Self, ParseError> {
         let tokens = Tokenizer::new(input).tokenize()?;
@@ -623,7 +757,16 @@ impl Expr {
             Expr::BinaryOp(left, op, right) => {
                 let left_val = Self::resolve_value(left, row, columns);
                 let right_val = Self::resolve_value(right, row, columns);
-                Self::compare(&left_val, &right_val, op)
+                match op {
+                    // Arithmetic in boolean context: truthy when the result is a
+                    // non-zero number (mirrors the Negate arm).
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        let result = FieldValue::apply_arith(&left_val, &right_val, op);
+                        matches!(FieldValue::as_f64(&result), Some(n) if n != 0.0)
+                    }
+                    // Comparison ops.
+                    _ => Self::compare(&left_val, &right_val, op),
+                }
             }
 
             Expr::LogicalOp(logic, left, right) => match logic {
@@ -632,6 +775,12 @@ impl Expr {
             },
 
             Expr::Not(inner) => !inner.evaluate(row, columns),
+
+            Expr::Negate(inner) => {
+                // Unary minus: truthy when the negated value is a non-zero number.
+                let v = Self::resolve_value(inner, row, columns);
+                matches!(FieldValue::as_f64(&v), Some(n) if n != 0.0)
+            }
 
             Expr::NullCheck(col_name, is_not) => {
                 if let Some(idx) = columns.iter().position(|c| &c.name == col_name) {
@@ -664,25 +813,35 @@ impl Expr {
                 }
             }
             Expr::Literal(v) => v.clone(),
-            // For nested expressions in comparisons, evaluate recursively
+            // Unary minus: negate the resolved value (Null propagates).
+            Expr::Negate(inner) => {
+                let v = Self::resolve_value(inner, row, columns);
+                match FieldValue::as_f64(&v) {
+                    Some(n) => FieldValue::Float(-n),
+                    None => FieldValue::Null,
+                }
+            }
+            // Arithmetic: resolve both sides, apply the operator (Null propagates).
+            Expr::BinaryOp(left, op, right) => {
+                let left_val = Self::resolve_value(left, row, columns);
+                let right_val = Self::resolve_value(right, row, columns);
+                FieldValue::apply_arith(&left_val, &right_val, op)
+            }
+            // Logical / null-check / IN have no value context — Null.
             _ => FieldValue::Null,
-        }
-    }
-
-    /// Convert a FieldValue to f64 for numeric comparison (returns None if not numeric).
-    fn as_f64(v: &FieldValue) -> Option<f64> {
-        use FieldValue::*;
-        match v {
-            Integer(n) => Some(*n as f64),
-            Float(f) => Some(*f),
-            Text(s) => s.parse::<f64>().ok(),
-            _ => None,
         }
     }
 
     /// Compare two field values using the given binary operator.
     fn compare(left: &FieldValue, right: &FieldValue, op: &BinOp) -> bool {
         use FieldValue::*;
+
+        // Arithmetic ops have no comparison meaning — truthy when the
+        // computed result is non-zero (mirrors the evaluate() arm).
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+            let result = FieldValue::apply_arith(left, right, op);
+            return matches!(FieldValue::as_f64(&result), Some(n) if n != 0.0);
+        }
 
         // Null comparisons: only = and != make sense
         match (left, right) {
@@ -692,7 +851,7 @@ impl Expr {
         }
 
         // Try numeric comparison first: if both sides are parseable as numbers, compare numerically.
-        if let (Some(l_num), Some(r_num)) = (Self::as_f64(left), Self::as_f64(right)) {
+        if let (Some(l_num), Some(r_num)) = (FieldValue::as_f64(left), FieldValue::as_f64(right)) {
             return match op {
                 BinOp::Eq => (l_num - r_num).abs() < 1e-9,
                 BinOp::Neq => (l_num - r_num).abs() >= 1e-9,
@@ -700,6 +859,11 @@ impl Expr {
                 BinOp::Lt => l_num < r_num,
                 BinOp::Ge => l_num >= r_num,
                 BinOp::Le => l_num <= r_num,
+                // Arithmetic ops: truthy when the computed result is non-zero.
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    let result = FieldValue::apply_arith(left, right, op);
+                    matches!(FieldValue::as_f64(&result), Some(n) if n != 0.0)
+                }
             };
         }
 
@@ -716,6 +880,9 @@ impl Expr {
             BinOp::Lt => left < right,
             BinOp::Ge => left >= right,
             BinOp::Le => left <= right,
+            // Arithmetic ops have no meaning on raw text; the numeric path
+            // in `compare` handles them via `apply_arith`.
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
         }
     }
 }
@@ -731,6 +898,39 @@ pub enum FieldValue {
 }
 
 impl FieldValue {
+    /// Apply an arithmetic operator to two resolved values.
+    /// Null or non-numeric operands yield Null (matches the lenient
+    /// degrade-to-literal semantics of the rest of the evaluator).
+    pub fn apply_arith(left: &FieldValue, right: &FieldValue, op: &BinOp) -> FieldValue {
+        let (l, r) = match (FieldValue::as_f64(left), FieldValue::as_f64(right)) {
+            (Some(l), Some(r)) => (l, r),
+            _ => return FieldValue::Null,
+        };
+        let result = match op {
+            BinOp::Add => l + r,
+            BinOp::Sub => l - r,
+            BinOp::Mul => l * r,
+            BinOp::Div => l / r,
+            _ => return FieldValue::Null,
+        };
+        if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+            FieldValue::Integer(result as i64)
+        } else {
+            FieldValue::Float(result)
+        }
+    }
+
+    /// Convert a FieldValue to f64 for numeric comparison (returns None if not numeric).
+    pub fn as_f64(v: &FieldValue) -> Option<f64> {
+        use FieldValue::*;
+        match v {
+            Integer(n) => Some(*n as f64),
+            Float(f) => Some(*f),
+            Text(s) => s.parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
     /// Convert a raw string into the appropriate typed field based on the column's type hint.
     pub fn from_str(value: &str, type_hint: &TypeHint) -> Self {
         let trimmed = value.trim();
@@ -1093,6 +1293,33 @@ mod tests {
     }
 
     #[test]
+    fn test_expr_referenced_columns() {
+        let cols = vec![
+            "id".to_string(),
+            "amount".to_string(),
+            "status".to_string(),
+        ];
+        let expr = Expr::parse(
+            "amount > 100 AND status IS NOT NULL",
+            &cols,
+        )
+        .unwrap();
+        assert_eq!(expr.referenced_columns(), vec!["amount".to_string(), "status".to_string()]);
+
+        // Unknown identifiers degrade to literals — they must NOT appear.
+        let expr = Expr::parse("amount > missing_col", &cols).unwrap();
+        assert_eq!(expr.referenced_columns(), vec!["amount".to_string()]);
+
+        // IN references its column.
+        let expr = Expr::parse("id IN (1, 2)", &cols).unwrap();
+        assert_eq!(expr.referenced_columns(), vec!["id".to_string()]);
+
+        // Duplicates collapse.
+        let expr = Expr::parse("amount > 1 AND amount < 10", &cols).unwrap();
+        assert_eq!(expr.referenced_columns(), vec!["amount".to_string()]);
+    }
+
+    #[test]
     fn test_expr_evaluate_gt() {
         let headers = vec!["id".to_string(), "amount".to_string()];
         let profiles = vec![
@@ -1312,5 +1539,204 @@ mod tests {
         let expr = Expr::parse("NOT status", &table.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()).unwrap();
         let filtered = table.where_clause(&expr);
         assert_eq!(filtered.row_count(), 1); // only row with false
+    }
+
+    // ---- Unary-minus boundary: the closed-set disambiguation ----
+    //
+    // The tokenizer classifies a `-` token by the *previous* token. A closed
+    // set of value-ending tokens (Ident/StringLit/Number/Bool/Null/RParen)
+    // means "a value already exists, so this minus is binary Sub"; anywhere
+    // else it is unary Negate. These tests pin that boundary so a future
+    // tokenizer change that widens or narrows the set fails loudly.
+
+    /// A 2-column integer table: `a` = [1, 2, 3], `b` = [10, 20, 30].
+    fn arith_table() -> TypedTable {
+        let headers = vec!["a".to_string(), "b".to_string()];
+        let profiles = vec![
+            ColumnProfile { total_rows: 3, null_count: 0, cardinality: 3, is_constant: false, uniqueness_ratio: 1.0, type_hint: TypeHint::Integer },
+            ColumnProfile { total_rows: 3, null_count: 0, cardinality: 3, is_constant: false, uniqueness_ratio: 1.0, type_hint: TypeHint::Integer },
+        ];
+        let rows = vec![
+            vec!["1".to_string(), "10".to_string()],
+            vec!["2".to_string(), "20".to_string()],
+            vec!["3".to_string(), "30".to_string()],
+        ];
+        TypedTable::from_untyped(&headers, &rows, &profiles)
+    }
+
+    fn cols(t: &TypedTable) -> Vec<String> {
+        t.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// `a - -b` — the inner minus follows a `Minus` token (not a value), so it
+    /// is unary. Structure: BinaryOp(a, Sub, Negate(b)). Row 1: 1 - (-10) = 11.
+    #[test]
+    fn test_unary_minus_after_binary_minus() {
+        let table = arith_table();
+        let expr = Expr::parse("a - -b", &cols(&table)).unwrap();
+        match &expr {
+            Expr::BinaryOp(l, BinOp::Sub, r) => {
+                assert!(matches!(**l, Expr::Column(_)));
+                assert!(matches!(**r, Expr::Negate(_)));
+            }
+            other => panic!("expected BinaryOp Sub, got {other:?}"),
+        }
+        // Value context: row 1 -> 1 - (-10) = 11.
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(11.0));
+    }
+
+    /// `a*-b` — minus after `*` (an operator, not a value) is unary.
+    /// Structure: BinaryOp(a, Mul, Negate(b)). Row 1: 1 * (-10) = -10.
+    #[test]
+    fn test_unary_minus_after_star() {
+        let table = arith_table();
+        let expr = Expr::parse("a*-b", &cols(&table)).unwrap();
+        match &expr {
+            Expr::BinaryOp(l, BinOp::Mul, r) => {
+                assert!(matches!(**l, Expr::Column(_)));
+                assert!(matches!(**r, Expr::Negate(_)));
+            }
+            other => panic!("expected BinaryOp Mul, got {other:?}"),
+        }
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(-10.0));
+    }
+
+    /// `5 - -3` — the second minus is in unary position, so the tokenizer
+    /// folds it into a negative literal. Structure: BinaryOp(5, Sub, Literal(-3)).
+    /// Value: 5 - (-3) = 8.
+    #[test]
+    fn test_binary_minus_folded_negative_literal() {
+        let table = arith_table();
+        let expr = Expr::parse("5 - -3", &cols(&table)).unwrap();
+        match &expr {
+            Expr::BinaryOp(_, BinOp::Sub, r) => {
+                // The right side must be a folded negative literal, NOT a Negate.
+                assert!(matches!(**r, Expr::Literal(FieldValue::Integer(-3)) | Expr::Literal(FieldValue::Float(-3.0))));
+            }
+            other => panic!("expected BinaryOp Sub, got {other:?}"),
+        }
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(8.0));
+    }
+
+    /// `-(a + b)` — minus after `(` is unary and wraps a parenthesized expr.
+    /// Structure: Negate(BinaryOp(a, Add, b)). Row 1: -(1 + 10) = -11.
+    #[test]
+    fn test_unary_minus_parenthesized() {
+        let table = arith_table();
+        let expr = Expr::parse("-(a + b)", &cols(&table)).unwrap();
+        match &expr {
+            Expr::Negate(inner) => assert!(matches!(**inner, Expr::BinaryOp(_, BinOp::Add, _))),
+            other => panic!("expected Negate, got {other:?}"),
+        }
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(-11.0));
+    }
+
+    /// Leading minus at start of input is unary: `-a` -> Negate(a).
+    /// Row 1: -1.
+    #[test]
+    fn test_unary_minus_leading() {
+        let table = arith_table();
+        let expr = Expr::parse("-a", &cols(&table)).unwrap();
+        assert!(matches!(&expr, Expr::Negate(_)));
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(-1.0));
+    }
+
+    /// Plain binary subtraction: `a - b` is BinaryOp Sub, no Negate anywhere.
+    /// Row 1: 1 - 10 = -9.
+    #[test]
+    fn test_binary_minus_plain() {
+        let table = arith_table();
+        let expr = Expr::parse("a - b", &cols(&table)).unwrap();
+        match &expr {
+            Expr::BinaryOp(_, BinOp::Sub, _) => {}
+            other => panic!("expected BinaryOp Sub, got {other:?}"),
+        }
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(-9.0));
+    }
+
+    /// Precedence: `a + b * 2` -> a + (b*2), not (a+b)*2. Row 1: 1 + 20 = 21.
+    #[test]
+    fn test_precedence_mul_over_add() {
+        let table = arith_table();
+        let expr = Expr::parse("a + b * 2", &cols(&table)).unwrap();
+        // Top node must be Add with a Mul on the right.
+        match &expr {
+            Expr::BinaryOp(_, BinOp::Add, r) => assert!(matches!(**r, Expr::BinaryOp(_, BinOp::Mul, _))),
+            other => panic!("expected top-level Add, got {other:?}"),
+        }
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(21.0));
+    }
+
+    /// Unary binds tighter than binary: `a - -b * 2` -> a - ((-b) * 2).
+    /// Row 1: 1 - ((-10) * 2) = 1 - (-20) = 21.
+    #[test]
+    fn test_unary_binds_tighter_than_mul() {
+        let table = arith_table();
+        let expr = Expr::parse("a - -b * 2", &cols(&table)).unwrap();
+        // Top is Sub; right side is Mul whose left is Negate(b).
+        match &expr {
+            Expr::BinaryOp(_, BinOp::Sub, r) => match &**r {
+                Expr::BinaryOp(l, BinOp::Mul, _) => assert!(matches!(**l, Expr::Negate(_))),
+                other => panic!("expected right side Mul, got {other:?}"),
+            },
+            other => panic!("expected top-level Sub, got {other:?}"),
+        }
+        let row = &table.rows[0];
+        let v = Expr::resolve_value(&expr, row, &table.columns);
+        assert_eq!(FieldValue::as_f64(&v), Some(21.0));
+    }
+
+    /// Unary minus in a predicate (boolean context): `a > -5` is true for all
+    /// rows (1,2,3 all > -5). The `-5` is a folded negative literal.
+    #[test]
+    fn test_unary_minus_in_predicate() {
+        let table = arith_table();
+        let expr = Expr::parse("a > -5", &cols(&table)).unwrap();
+        let filtered = table.where_clause(&expr);
+        assert_eq!(filtered.row_count(), 3);
+    }
+
+    /// `a + b > 25` — arithmetic feeds a comparison. Rows: 11, 22, 33.
+    /// Only 33 > 25.
+    #[test]
+    fn test_arithmetic_feeds_comparison() {
+        let table = arith_table();
+        let expr = Expr::parse("a + b > 25", &cols(&table)).unwrap();
+        let filtered = table.where_clause(&expr);
+        assert_eq!(filtered.row_count(), 1);
+    }
+
+    /// Null propagates through arithmetic: a row where `b` is null yields
+    /// Null for `a * b`, which is falsy in a boolean context.
+    #[test]
+    fn test_arith_null_propagates() {
+        let headers = vec!["a".to_string(), "b".to_string()];
+        let profiles = vec![
+            ColumnProfile { total_rows: 2, null_count: 0, cardinality: 2, is_constant: false, uniqueness_ratio: 1.0, type_hint: TypeHint::Integer },
+            ColumnProfile { total_rows: 2, null_count: 1, cardinality: 1, is_constant: false, uniqueness_ratio: 0.5, type_hint: TypeHint::Integer },
+        ];
+        let rows = vec![
+            vec!["1".to_string(), "10".to_string()],
+            vec!["2".to_string(), "NULL".to_string()],
+        ];
+        let table = TypedTable::from_untyped(&headers, &rows, &profiles);
+        let expr = Expr::parse("a * b", &cols(&table)).unwrap();
+        // Row 1: 1*10 = 10 (truthy). Row 2: 2*Null = Null (falsy).
+        let filtered = table.where_clause(&expr);
+        assert_eq!(filtered.row_count(), 1);
     }
 }
