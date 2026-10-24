@@ -10,6 +10,7 @@
 pub mod csv_parser;
 pub mod dedup;
 pub mod errors;
+pub mod expr;
 pub mod ranking;
 pub mod table;
 
@@ -17,3 +18,4 @@ pub use csv_parser::*;
 pub use dedup::*;
 pub use ranking::*;
 pub use table::*;
+pub use errors::{RsfError, RsfResult, IntoAnyhow};

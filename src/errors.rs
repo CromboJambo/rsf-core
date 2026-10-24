@@ -1,3 +1,5 @@
+use anyhow::{Error, Context};
+
 /// Custom error type for RSF operations (retained for display purposes)
 #[derive(Debug)]
 pub enum RsfError {
@@ -43,6 +45,17 @@ impl std::error::Error for RsfError {
 impl From<std::io::Error> for RsfError {
     fn from(err: std::io::Error) -> Self {
         RsfError::IoError { path: std::path::PathBuf::from("<unknown>"), cause: err }
+    }
+}
+
+/// Convert RsfError to anyhow::Error with context
+pub trait IntoAnyhow {
+    fn into_anyhow(self) -> Error;
+}
+
+impl IntoAnyhow for RsfError {
+    fn into_anyhow(self) -> Error {
+        Error::new(self).context("RSF operation failed")
     }
 }
 

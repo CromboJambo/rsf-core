@@ -1,0 +1,69 @@
+// RSF Expression Language Grammar for Pest Parser
+// Validates expression syntax; actual parsing done by recursive descent parser.
+
+WHITESPACE = @{ " " | "\t" | "\n" | "\r" }
+
+// Identifiers: column names, function names
+IDENTIFIER = @{ (LETTER | "_")+ }
+
+// Numeric literals
+INTEGER = @{ "-"? DIGIT+ }
+FLOAT = @{ INTEGER "." DIGIT+ }
+
+// String literals
+STRING = @{ "\"" (!"\"" ANY)* "\"" }
+
+// Comparison operators
+EQ = "==" | "="
+NEQ = "!=" | "<>"
+LT = "<"
+GT = ">"
+LE = "<="
+GE = ">="
+
+// Arithmetic operators
+PLUS = "+"
+MINUS = "-"
+MULTIPLY = "*"
+DIVIDE = "/"
+
+// Logical keywords (case-insensitive handled by parser)
+AND_KW = { "and"i }
+OR_KW = { "or"i }
+NOT_KW = { "not"i }
+TRUE_KW = { "true"i }
+FALSE_KW = { "false"i }
+NULL_KW = { "null"i }
+IN_KW = { "in"i }
+IS_KW = { "is"i }
+
+// Literals
+literal: INTEGER | FLOAT | STRING | TRUE_KW | FALSE_KW | NULL_KW
+
+// Primary expressions (highest precedence)
+primary: "(" expression ")" | IDENTIFIER | literal
+
+// Unary expressions
+unary: NOT_KW unary | MINUS unary | primary
+
+// Multiplicative
+multiplicative: unary ((MULTIPLY | DIVIDE) unary)*
+
+// Additive
+additive: multiplicative ((PLUS | MINUS) multiplicative)*
+
+// Comparison
+comparison: additive ((EQ | NEQ | LT | GT | LE | GE) additive)?
+
+// IN clause
+in_clause: IDENTIFIER IN_KW "(" in_value ("," in_value)* ")"
+in_value: literal
+
+// IS NULL / IS NOT NULL
+is_null_check: IDENTIFIER IS_KW (NOT_KW?) NULL_KW
+
+// AND expressions
+and_expr: comparison (AND_KW comparison)*
+
+// OR expressions (lowest precedence)
+expression: and_expr (OR_KW and_expr)*
