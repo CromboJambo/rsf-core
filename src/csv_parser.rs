@@ -262,8 +262,8 @@ pub fn load_csv(path: &std::path::PathBuf) -> anyhow::Result<Table> {
         }
     }
 
-    // Parse all rows (excluding header at index 0)
-    let rows: Vec<Vec<Field>> = result_lines[1..]
+    // Parse all rows (header was already parsed separately)
+    let rows: Vec<Vec<Field>> = result_lines
         .iter()
         .map(|line| parse_csv_row(line))
         .collect();
@@ -276,8 +276,9 @@ fn is_header_continuation(line1: &str, line2: &str) -> bool {
     let trimmed1 = line1.trim();
     let trimmed2 = line2.trim_start();
 
-    // Simple heuristic: if line1 ends with unquoted word and line2 starts with continuation
-    !trimmed1.ends_with('"') && !trimmed2.starts_with('"')
+    // Only merge if line1 has an unbalanced opening quote (embedded newline in quoted field)
+    let open_quotes = trimmed1.chars().filter(|&c| c == '"').count();
+    open_quotes % 2 == 1
 }
 
 /// Merge two lines that were split by an embedded newline in a quoted field
